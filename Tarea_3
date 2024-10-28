@@ -1,1 +1,102 @@
+# Importamos las librerías necesarias para la producción y análisis de datos
+import time
+import json
+import random
+from datetime import datetime
+from kafka import KafkaProducer
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.functions import from_json, col, window, when, round, avg
+from pyspark.sql.types import StructType, StructField, FloatType, IntegerType, StringType, TimestampType
 
+# Configuración del productor de datos
+class UrbanDataProducer:
+    """
+    Clase para generar y enviar datos de ruido y CO₂ a un topic de Kafka.
+    """
+    def __init__(self, bootstrap_servers=['localhost:9092']):
+        self.producer = KafkaProducer(
+            bootstrap_servers=bootstrap_servers,
+            value_serializer=lambda x: json.dumps(x).encode('utf-8')
+        )
+        # Definimos las ubicaciones simuladas con sus rangos de ruido y CO₂
+        self.locations = {
+            1: {"name": "Zona Industrial", "noise_range": (70, 100), "co2_range": (400, 600)},
+            2: {"name": "Zona Residencial", "noise_range": (30, 50), "co2_range": (300, 400)},
+            3: {"name": "Zona Comercial", "noise_range": (50, 80), "co2_range": (350, 450)}
+        }
+
+    def generate_sensor_data(self, location_id):
+        """
+        Genera datos de ruido y CO₂ para una ubicación específica.
+        """
+        config = self.locations[location_id]
+        noise_level = round(random.uniform(*config["noise_range"]), 2)
+        co2_level = round(random.uniform(*config["co2_range"]), 2)
+        return {
+            "location_id": location_id,
+            "location_name": config["name"],
+            "timestamp": datetime.now().isoformat(),
+            "noise_level": noise_level,
+            "co2_level": co2_level
+        }
+
+    def run(self):
+        """
+        Inicia la producción de datos en un bucle infinito.
+        """
+        print("Iniciando productor de datos de ambiente urbano...")
+        try:
+            while True:
+                for location_id in self.locations.keys():
+                    data = self.generate_sensor_data(location_id)
+                    self.producer.send('urban_data', value=data)
+                    print(f"Enviado: {json.dumps(data, indent=2)}")
+                time.sleep(1)  # Espera 1 segundo entre envíos
+        except KeyboardInterrupt:
+            print("\nDeteniendo el productor...")
+            self.producer.close()
+
+# Función principal para analizar los datos
+def analyze_data():
+    # Inicializa una sesión de Spark para procesar los datos
+    spark = SparkSession.builder \
+        .appName("UrbanDataAnalysis") \
+        .getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+
+    # Definimos el esquema de los datos que recibiremos
+    schema = StructType([
+        StructField("location_id", IntegerType(), True),
+        StructField("location_name", StringType(), True),
+        StructField("timestamp", TimestampType(), True),
+        StructField("noise_level", FloatType(), True),
+        StructField("co2_level", FloatType(), True)
+    ])
+
+    # Leemos los datos del topic de Kafka
+    df = spark \
+        .readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "localhost:9092") \
+        .option("subscribe", "urban_data") \
+        .load()
+
+    # Parseamos el JSON desde el valor recibido en Kafka
+    parsed_df = df.select(from_json(col("value").cast("string"), schema).alias("data")).select("data.*")
+
+    # 1. Análisis de los niveles promedio de ruido y CO₂ por ubicación
+    windowed_stats = parsed_df \
+        .withWatermark("timestamp", "5 minutes") \
+        .groupBy(window(col("timestamp"), "1 minute"), "location_id") \
+        .agg(
+            round(avg("noise_level"), 2).alias("avg_noise_level"),
+            round(avg("co2_level"), 2).alias("avg_co2_level")
+        ) \
+        .withColumn(
+            "alert_noise_level", 
+            when((col("avg_noise_level") > 85), "Noise Alert").otherwise("")
+        ) \
+        .withColumn(
+            "alert_co2_level", 
+            when((col("avg_co2_level") >
